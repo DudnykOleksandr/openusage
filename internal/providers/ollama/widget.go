@@ -10,7 +10,7 @@ func dashboardWidget() core.DashboardWidget {
 		providerbase.WithColorRole(core.DashboardColorRoleAuto),
 		providerbase.WithGaugeMaxLines(3),
 		providerbase.WithGaugePriority(
-			"usage_five_hour", "usage_weekly", "usage_one_day",
+			"usage_five_hour", "usage_weekly", "usage_one_day", "cloud_credits",
 		),
 		providerbase.WithCompactRows(
 			core.DashboardCompactRow{
@@ -77,6 +77,8 @@ func dashboardWidget() core.DashboardWidget {
 			"usage_five_hour":         "Usage 5h",
 			"usage_weekly":            "Usage Weekly",
 			"usage_one_day":           "Usage 1d",
+			"cloud_credits":           "Cloud Credits",
+			"purchased_credits":       "Purchased Credits",
 			"requests_5h":             "5h Requests",
 			"messages_5h":             "5h Messages",
 			"sessions_5h":             "5h Sessions",

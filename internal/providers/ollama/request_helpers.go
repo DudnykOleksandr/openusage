@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -200,6 +201,100 @@ func fetchCloudUsageFromSettingsPage(ctx context.Context, cloudBaseURL, apiKey s
 			snap.Resets["usage_one_day"] = t
 		}
 		found = true
+	}
+	return found, nil
+}
+
+type cloudBalanceWindow struct {
+	RemainingPercent *float64 `json:"remaining_percent"`
+	ResetsAt         string   `json:"resets_at"`
+}
+
+// cloudBalanceResponse is GET /api/balance (https://docs.ollama.com/api/balance): legacy plans report
+// session/weekly remaining percent, credit-based plans report a monthly USD allowance.
+type cloudBalanceResponse struct {
+	Included struct {
+		Session      *cloudBalanceWindow `json:"session"`
+		Weekly       *cloudBalanceWindow `json:"weekly"`
+		BalanceUSD   *float64            `json:"balance_usd"`
+		AllowanceUSD *float64            `json:"allowance_usd"`
+		Period       struct {
+			Until string `json:"until"`
+		} `json:"period"`
+	} `json:"included"`
+	Purchased struct {
+		BalanceUSD *float64 `json:"balance_usd"`
+	} `json:"purchased"`
+}
+
+func fetchCloudBalance(ctx context.Context, cloudBaseURL, apiKey string, snap *core.UsageSnapshot, client *http.Client) (bool, error) {
+	if apiKey == "" {
+		return false, nil
+	}
+	var balance cloudBalanceResponse
+	status, _, err := doJSONRequest(ctx, http.MethodGet, cloudEndpointURL(cloudBaseURL, "/api/balance"), apiKey, &balance, client)
+	if err != nil {
+		return false, fmt.Errorf("ollama: cloud balance request failed: %w", err)
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return false, nil
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("ollama: cloud balance endpoint returned HTTP %d", status)
+	}
+
+	hundred := 100.0
+	percentMetric := func(w *cloudBalanceWindow, window string) (core.Metric, time.Time, bool) {
+		if w == nil || w.RemainingPercent == nil {
+			return core.Metric{}, time.Time{}, false
+		}
+		remaining := *w.RemainingPercent
+		m := core.Metric{
+			Limit:     core.Float64Ptr(hundred),
+			Remaining: core.Float64Ptr(remaining),
+			Used:      core.Float64Ptr(math.Round((hundred-remaining)*100) / 100),
+			Unit:      "%",
+			Window:    window,
+		}
+		resetAt, _ := parseAnyTime(strings.TrimSpace(w.ResetsAt))
+		return m, resetAt, true
+	}
+
+	found := false
+	if m, resetAt, ok := percentMetric(balance.Included.Session, "5h"); ok {
+		snap.Metrics["usage_five_hour"] = m
+		if !resetAt.IsZero() {
+			snap.Resets["usage_five_hour"] = resetAt
+			snap.SetAttribute("block_end", resetAt.Format(time.RFC3339))
+			snap.SetAttribute("block_start", resetAt.Add(-5*time.Hour).Format(time.RFC3339))
+		}
+		found = true
+	}
+	if m, resetAt, ok := percentMetric(balance.Included.Weekly, "1w"); ok {
+		snap.Metrics["usage_weekly"] = m
+		day := m
+		day.Window = "1d"
+		snap.Metrics["usage_one_day"] = day
+		if !resetAt.IsZero() {
+			snap.Resets["usage_weekly"] = resetAt
+			snap.Resets["usage_one_day"] = resetAt
+		}
+		found = true
+	}
+	if b, a := balance.Included.BalanceUSD, balance.Included.AllowanceUSD; b != nil {
+		m := core.Metric{Remaining: core.Float64Ptr(*b), Unit: "USD", Window: "month"}
+		if a != nil {
+			m.Limit = core.Float64Ptr(*a)
+			m.Used = core.Float64Ptr(*a - *b)
+		}
+		snap.Metrics["cloud_credits"] = m
+		if t, ok := parseAnyTime(strings.TrimSpace(balance.Included.Period.Until)); ok {
+			snap.Resets["cloud_credits"] = t
+		}
+		found = true
+	}
+	if b := balance.Purchased.BalanceUSD; b != nil && *b > 0 {
+		snap.Metrics["purchased_credits"] = core.Metric{Remaining: core.Float64Ptr(*b), Unit: "USD", Window: "current"}
 	}
 	return found, nil
 }

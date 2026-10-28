@@ -65,6 +65,14 @@ func (p *Provider) fetchCloudAPI(ctx context.Context, acct core.AccountConfig, a
 	}
 
 	if _, ok := snap.Metrics["usage_five_hour"]; !ok {
+		if parsed, balanceErr := fetchCloudBalance(ctx, cloudBaseURL, apiKey, snap, p.Client()); balanceErr != nil {
+			snap.SetDiagnostic("cloud_balance_error", balanceErr.Error())
+		} else if parsed {
+			hasData = true
+		}
+	}
+
+	if _, ok := snap.Metrics["usage_five_hour"]; !ok {
 		if parsed, parseErr := fetchCloudUsageFromSettingsPage(ctx, cloudBaseURL, apiKey, acct, snap, p.Client()); parseErr != nil {
 			snap.SetDiagnostic("cloud_usage_settings_error", parseErr.Error())
 		} else if parsed {

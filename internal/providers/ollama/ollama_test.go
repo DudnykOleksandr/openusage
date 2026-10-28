@@ -500,6 +500,103 @@ func TestFetch_CloudSettingsFallbackUsage(t *testing.T) {
 	}
 }
 
+func newCloudBalanceServer(t *testing.T, balance string, settingsCalls *int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"acct-123","plan":"pro"}`))
+		case "/api/tags":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"models":[]}`))
+		case "/api/balance":
+			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer test-key" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(balance))
+		case "/settings":
+			*settingsCalls++
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func fetchCloudOnly(t *testing.T, serverURL string) core.UsageSnapshot {
+	t.Helper()
+	t.Setenv("TEST_OLLAMA_KEY", "test-key")
+	acct := core.AccountConfig{
+		ID:           "test-ollama-cloud",
+		Provider:     "ollama",
+		Auth:         "api_key",
+		APIKeyEnv:    "TEST_OLLAMA_KEY",
+		RuntimeHints: map[string]string{"cloud_base_url": serverURL},
+	}
+	snap, err := New().Fetch(context.Background(), acct)
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if snap.Status != core.StatusOK {
+		t.Fatalf("Status = %v, want OK", snap.Status)
+	}
+	return snap
+}
+
+func TestFetch_CloudBalanceSessionWeekly(t *testing.T) {
+	settingsCalls := 0
+	server := newCloudBalanceServer(t, `{"included":{"session":{"remaining_percent":88.59,"resets_at":"2026-10-28T19:00:00Z"},"weekly":{"remaining_percent":75,"resets_at":"2026-11-02T00:00:00Z"}},"purchased":{"balance_usd":0}}`, &settingsCalls)
+	defer server.Close()
+
+	snap := fetchCloudOnly(t, server.URL)
+
+	m := snap.Metrics["usage_five_hour"]
+	if m.Used == nil || *m.Used != 11.41 || m.Remaining == nil || *m.Remaining != 88.59 || m.Limit == nil || *m.Limit != 100 {
+		t.Fatalf("usage_five_hour = %+v, want used=11.41 remaining=88.59 limit=100", m)
+	}
+	if got := snap.Resets["usage_five_hour"]; !got.Equal(time.Date(2026, 10, 28, 19, 0, 0, 0, time.UTC)) {
+		t.Fatalf("usage_five_hour reset = %v, want 2026-10-28T19:00:00Z", got)
+	}
+	w := snap.Metrics["usage_weekly"]
+	if w.Used == nil || *w.Used != 25 || w.Window != "1w" {
+		t.Fatalf("usage_weekly = %+v, want used=25 window=1w", w)
+	}
+	if got := snap.Resets["usage_weekly"]; !got.Equal(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("usage_weekly reset = %v, want 2026-11-02T00:00:00Z", got)
+	}
+	if _, ok := snap.Metrics["purchased_credits"]; ok {
+		t.Fatal("purchased_credits should be absent when balance is 0")
+	}
+	if settingsCalls != 0 {
+		t.Fatalf("settings page fetched %d times, want 0 when /api/balance answered", settingsCalls)
+	}
+}
+
+func TestFetch_CloudBalanceCredits(t *testing.T) {
+	settingsCalls := 0
+	server := newCloudBalanceServer(t, `{"included":{"balance_usd":12.5,"allowance_usd":20,"period":{"until":"2026-11-15T00:00:00Z"}},"purchased":{"balance_usd":3}}`, &settingsCalls)
+	defer server.Close()
+
+	snap := fetchCloudOnly(t, server.URL)
+
+	c := snap.Metrics["cloud_credits"]
+	if c.Remaining == nil || *c.Remaining != 12.5 || c.Limit == nil || *c.Limit != 20 || c.Used == nil || *c.Used != 7.5 || c.Unit != "USD" {
+		t.Fatalf("cloud_credits = %+v, want remaining=12.5 limit=20 used=7.5 USD", c)
+	}
+	if got := snap.Resets["cloud_credits"]; !got.Equal(time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("cloud_credits reset = %v, want 2026-11-15T00:00:00Z", got)
+	}
+	if p := snap.Metrics["purchased_credits"]; p.Remaining == nil || *p.Remaining != 3 {
+		t.Fatalf("purchased_credits = %+v, want remaining=3", p)
+	}
+	if _, ok := snap.Metrics["usage_five_hour"]; ok {
+		t.Fatal("usage_five_hour must not be invented for a credit-based plan")
+	}
+}
+
 func TestFetchServerLogs_CountsAnthropicMessagesPath(t *testing.T) {
 	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
